@@ -102,11 +102,13 @@
     const el = $("messageInput");
     el.disabled = true;
     el.setAttribute("placeholder", placeholderText || "Sign up to keep chatting");
+    if ($("micBtn")) $("micBtn").disabled = true;
   }
 
   function unlockComposer() {
     const el = $("messageInput");
     el.disabled = false;
+    if ($("micBtn")) $("micBtn").disabled = false;
     el.setAttribute("placeholder", placeholders[0]);
   }
 
@@ -189,8 +191,220 @@
     $("gateAuthBtn").addEventListener("click", () => openAuthModal("signup"));
   }
 
+  // ---------- voice (free, built into the browser) ----------
+  const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const voice = {
+    speakReplies: localStorage.getItem("pb-voice") !== "off",
+    listening: false,
+    keepTalking: false, // true while a voice conversation is going
+    rec: null,
+    voiceName: localStorage.getItem("pb-voice-name") || "", // "" = automatic
+    rate: parseFloat(localStorage.getItem("pb-voice-rate")) || 1,
+  };
+
+  function setVoiceStatus(msg) {
+    const el = $("voiceStatus");
+    if (el) el.textContent = msg || "";
+  }
+
+  function speechLang(text) {
+    // Hindi in Devanagari gets a Hindi voice, everything else an Indian-English one.
+    if (/[ऀ-ॿ]/.test(text || "")) return "hi-IN";
+    return "en-IN";
+  }
+
+  function cleanForSpeech(text) {
+    return text
+      .replace(/\*\*(.+?)\*\*/g, "$1")
+      .replace(/https?:\/\/\S+/g, "link")
+      .replace(/[`#>*_]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function pickVoice(lang) {
+    const voices = window.speechSynthesis ? speechSynthesis.getVoices() : [];
+    if (voice.voiceName) {
+      const chosen = voices.find((v) => v.name === voice.voiceName);
+      // Use the chosen voice when it can read this language (e.g. don't read Hindi with an English voice).
+      if (chosen && chosen.lang.replace("_", "-").slice(0, 2) === lang.slice(0, 2)) return chosen;
+    }
+    return (
+      voices.find((v) => v.lang === lang) ||
+      voices.find((v) => v.lang.replace("_", "-").startsWith(lang.slice(0, 2))) ||
+      null
+    );
+  }
+
+  function stopSpeaking() {
+    if (window.speechSynthesis) speechSynthesis.cancel();
+    $("voiceToggle").classList.remove("speaking");
+  }
+
+  function speak(text) {
+    return new Promise((resolve) => {
+      if (!voice.speakReplies || !window.speechSynthesis) return resolve();
+      const spoken = cleanForSpeech(text);
+      if (!spoken) return resolve();
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(spoken);
+      u.lang = speechLang(spoken);
+      const v = pickVoice(u.lang);
+      if (v) { u.voice = v; u.lang = v.lang; }
+      u.rate = voice.rate;
+      u.onstart = () => {
+        $("voiceToggle").classList.add("speaking");
+        setVoiceStatus("Speaking…");
+      };
+      u.onend = u.onerror = () => {
+        $("voiceToggle").classList.remove("speaking");
+        setVoiceStatus("");
+        resolve();
+      };
+      speechSynthesis.speak(u);
+    });
+  }
+
+  function updateVoiceToggle() {
+    $("voiceIconOn").style.display = voice.speakReplies ? "block" : "none";
+    $("voiceIconOff").style.display = voice.speakReplies ? "none" : "block";
+    $("voiceToggle").setAttribute("aria-pressed", String(voice.speakReplies));
+    $("voiceToggle").title = "Spoken replies: " + (voice.speakReplies ? "on" : "off");
+  }
+
+  function stopListening() {
+    voice.keepTalking = false;
+    if (voice.rec) {
+      try { voice.rec.stop(); } catch (e) { /* already stopped */ }
+    }
+  }
+
+  function startListening() {
+    if (!SpeechRec || voice.listening || $("messageInput").disabled) return;
+    stopSpeaking();
+    const rec = new SpeechRec();
+    voice.rec = rec;
+    rec.lang = navigator.language && navigator.language.startsWith("hi") ? "hi-IN" : "en-IN";
+    rec.interimResults = true;
+    rec.continuous = false;
+    let finalText = "";
+    const input = $("messageInput");
+
+    rec.onstart = () => {
+      voice.listening = true;
+      $("micBtn").classList.add("listening");
+      setVoiceStatus("Listening… tap the mic to stop");
+    };
+    rec.onresult = (e) => {
+      let t = "";
+      for (const r of e.results) t += r[0].transcript;
+      input.value = t;
+      autoResize(input);
+      if (e.results[e.results.length - 1].isFinal) finalText = t;
+    };
+    rec.onerror = (e) => {
+      voice.keepTalking = false;
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        setVoiceStatus("Microphone is blocked. Allow it in your browser's site settings.");
+      } else if (e.error !== "no-speech" && e.error !== "aborted") {
+        setVoiceStatus("Mic error: " + e.error);
+      }
+    };
+    rec.onend = () => {
+      voice.listening = false;
+      $("micBtn").classList.remove("listening");
+      const text = finalText.trim();
+      if (text) {
+        input.value = "";
+        autoResize(input);
+        setVoiceStatus("");
+        sendMessage(text, { viaVoice: true });
+      } else {
+        if (!voice.keepTalking) setVoiceStatus("");
+        voice.keepTalking = false;
+      }
+    };
+    try { rec.start(); } catch (e) { /* start called twice */ }
+  }
+
+  function populateVoices() {
+    const sel = $("voiceSelect");
+    if (!sel || !window.speechSynthesis) return;
+    const voices = speechSynthesis.getVoices();
+    // Indian English and Hindi first, then other English, then everything else.
+    const rank = (v) => {
+      const l = v.lang.replace("_", "-");
+      if (l === "en-IN" || l === "hi-IN") return 0;
+      if (l.startsWith("en")) return 1;
+      return 2;
+    };
+    const sorted = voices.slice().sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+    sel.innerHTML = "";
+    const auto = document.createElement("option");
+    auto.value = "";
+    auto.textContent = "Voice: Auto";
+    sel.appendChild(auto);
+    sorted.forEach((v) => {
+      const o = document.createElement("option");
+      o.value = v.name;
+      o.textContent = v.name.replace(/^Microsoft |^Google /, "") + " (" + v.lang + ")";
+      sel.appendChild(o);
+    });
+    sel.value = voice.voiceName;
+    if (sel.value !== voice.voiceName) sel.value = "";
+  }
+
+  function wireVoice() {
+    updateVoiceToggle();
+
+    if (window.speechSynthesis) {
+      populateVoices();
+      speechSynthesis.onvoiceschanged = populateVoices; // voices often load a moment late
+    } else {
+      $("voiceSelect").hidden = true;
+      $("voiceSpeed").hidden = true;
+    }
+
+    $("voiceSelect").addEventListener("change", (e) => {
+      voice.voiceName = e.target.value;
+      localStorage.setItem("pb-voice-name", voice.voiceName);
+      // Play a short sample so you can hear the voice right away.
+      const wasOn = voice.speakReplies;
+      voice.speakReplies = true;
+      speak("Hi, I'm PrakharBot. This is how I sound.").then(() => { voice.speakReplies = wasOn; });
+    });
+
+    $("voiceSpeed").value = String(voice.rate);
+    if ($("voiceSpeed").value !== String(voice.rate)) $("voiceSpeed").value = "1";
+    $("voiceSpeed").addEventListener("change", (e) => {
+      voice.rate = parseFloat(e.target.value) || 1;
+      localStorage.setItem("pb-voice-rate", String(voice.rate));
+    });
+
+    $("voiceToggle").addEventListener("click", () => {
+      voice.speakReplies = !voice.speakReplies;
+      localStorage.setItem("pb-voice", voice.speakReplies ? "on" : "off");
+      if (!voice.speakReplies) stopSpeaking();
+      updateVoiceToggle();
+    });
+
+    if (!SpeechRec) {
+      // Firefox and some browsers: typing still works, spoken replies still work.
+      $("micBtn").hidden = true;
+      return;
+    }
+
+    $("micBtn").addEventListener("click", () => {
+      if (voice.listening) { stopListening(); return; }
+      voice.keepTalking = true;
+      startListening();
+    });
+  }
+
   // ---------- sending messages ----------
-  async function sendMessage(text) {
+  async function sendMessage(text, opts) {
+    opts = opts || {};
+    stopSpeaking();
     appendMessage("user", text);
     showChatView();
     const typingRow = appendTyping();
@@ -220,6 +434,12 @@
       if (data.gate) {
         appendGateCard();
         lockComposer("Sign up to keep chatting");
+      }
+
+      if (data.reply) {
+        await speak(data.reply);
+        // In a voice conversation, listen again once the bot finishes talking.
+        if (opts.viaVoice && voice.keepTalking && !data.gate) startListening();
       }
     } catch (err) {
       typingRow.remove();
@@ -286,6 +506,8 @@
     } catch (err) {
       /* ignore network hiccup, still reset UI locally */
     }
+    stopListening();
+    stopSpeaking();
     state.loggedIn = false;
     state.name = null;
     state.chatCount = 0;
@@ -404,6 +626,7 @@
   async function init() {
     initTheme();
     wireComposer();
+    wireVoice();
     wireAuthModal();
     startPlaceholderRotation();
 

@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 from flask import Flask, render_template, request, jsonify, session, send_file, redirect, url_for
@@ -29,8 +29,33 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Prakhar@123")
 ADMIN_DISPLAY_NAME = os.environ.get("ADMIN_DISPLAY_NAME", "Prakhar Sharma")
 ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD)
 
+# The chat is embedded in the portfolio site (a different domain) as a small panel.
+# Browsers only keep the login/guest session cookie inside such an embedded page when
+# it is marked SameSite=None; Secure, which needs HTTPS (Render provides it). It is on
+# by default on Render, and off for plain local runs. Override with CROSS_SITE_COOKIES=1/0.
+CROSS_SITE_COOKIES = os.environ.get("CROSS_SITE_COOKIES", "1" if os.environ.get("RENDER") else "0") == "1"
+# Websites allowed to embed the chat (comma separated). Everything else is refused.
+EMBED_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("EMBED_ALLOWED_ORIGINS", "https://prakhar-dev-iota.vercel.app").split(",")
+    if o.strip()
+]
+
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
+if CROSS_SITE_COOKIES:
+    app.config.update(SESSION_COOKIE_SAMESITE="None", SESSION_COOKIE_SECURE=True)
+
+
+@app.after_request
+def limit_who_can_embed(response):
+    """Only your portfolio may show the chat in a frame; the admin area can never be framed."""
+    if request.path.startswith("/admin") or request.path.startswith("/api/admin"):
+        response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+    else:
+        allowed = ["'self'", "http://localhost:*", "http://127.0.0.1:*"] + EMBED_ALLOWED_ORIGINS
+        response.headers["Content-Security-Policy"] = "frame-ancestors " + " ".join(allowed)
+    return response
 
 client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
@@ -106,6 +131,45 @@ def log_message(person_type, person_key, person_name, person_email, message, rep
     )
     conn.commit()
     conn.close()
+
+
+def recent_history(person_type, person_key, limit=6, max_age_minutes=30):
+    """Last few turns of this person's chat, so the bot remembers what you're discussing.
+
+    Read from our own log (not from the browser), and only recent turns, so an old
+    conversation doesn't suddenly come back after the visitor has moved on.
+    """
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT message, reply, created_at FROM messages
+        WHERE person_type = ? AND person_key = ?
+        ORDER BY id DESC LIMIT ?
+        """,
+        (person_type, person_key, limit),
+    ).fetchall()
+    conn.close()
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)
+    turns = []
+    for row in reversed(rows):
+        try:
+            when = datetime.fromisoformat(row["created_at"])
+        except ValueError:
+            continue
+        if when < cutoff:
+            continue
+        turns.append({"role": "user", "parts": [{"text": row["message"]}]})
+        turns.append({"role": "model", "parts": [{"text": row["reply"]}]})
+    return turns
+
+
+def visitor_first_name(name):
+    """A safe first name to hand to the model (the name comes from the signup form)."""
+    if not name:
+        return ""
+    first = name.split()[0] if name.split() else ""
+    return "".join(ch for ch in first if ch.isalpha())[:20]
 
 
 # --------------------------------------------------------------------------
@@ -202,13 +266,27 @@ def api_chat():
         person_name = f"Guest {person_key}"
         person_email = None
 
+    history = recent_history(person_type, person_key)
+    instruction = PROFILE
+    first_name = visitor_first_name(person_name) if logged_in else ""
+    if first_name:
+        instruction += (
+            f"\n\nThe visitor's name is {first_name}. Use it now and then, naturally, "
+            "not in every reply."
+        )
+    if not history:
+        instruction += (
+            "\n\nThis is the very start of the conversation, so greet them warmly in your own "
+            "words before or while you answer."
+        )
+
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=message,
+            contents=history + [{"role": "user", "parts": [{"text": message}]}],
             config=types.GenerateContentConfig(
-                system_instruction=PROFILE,
-                max_output_tokens=320,
+                system_instruction=instruction,
+                max_output_tokens=500,
                 temperature=0.85,
             ),
         )
